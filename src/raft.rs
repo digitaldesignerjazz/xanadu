@@ -81,3 +81,23 @@ pub enum Action {
     NeedSnapshot { to: String },
     Info(String),
 }
+
+pub struct Raft {
+    pub id: String,
+    pub cluster: Vec<String>,
+    pub role: Role,
+    pub current_term: u64,
+    pub voted_for: Option<String>,
+    pub log: Vec<LogEntry>,
+    pub commit_index: u64,
+    pub last_applied: u64,
+    pub leader_id: Option<String>,
+    next_index: HashMap<String, u64>,
+    match_index: HashMap<String, u64>,
+    votes: HashSet<String>,
+    election_deadline: Instant,
+    heartbeat_due: Instant,
+    data_path: PathBuf,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+}
