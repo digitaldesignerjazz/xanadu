@@ -1,10 +1,14 @@
+mod raft;
+
 use anyhow::{bail, Result};
 use clap::Parser;
+use raft::{Action, Raft, Rpc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
@@ -16,19 +20,19 @@ const DEFAULT_TTL: u8 = 8;
 const PROTO: &str = "XANADU/0.1";
 
 #[derive(Parser, Debug)]
-#[command(name = "xanadu", about = "Xanadu v0.1 mesh node — gossip broadcast")]
+#[command(name = "xanadu", about = "Xanadu mesh — gossip + Raft")]
 struct Args {
-    /// Listen address, e.g. 0.0.0.0:9100
     #[arg(long, default_value = "0.0.0.0:9100")]
     listen: SocketAddr,
-
-    /// Bootstrap peer addresses (repeatable: --peer a --peer b)
     #[arg(long)]
     peer: Vec<SocketAddr>,
-
-    /// Human-readable node name
     #[arg(long)]
     name: Option<String>,
+    /// Cluster member names for Raft quorum, e.g. alpha,beta,gamma
+    #[arg(long, value_delimiter = ',')]
+    cluster: Vec<String>,
+    #[arg(long, default_value = ".xanadu")]
+    data: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +41,7 @@ enum Wire {
     Hello { node_id: String, name: String },
     Welcome { node_id: String, name: String },
     Gossip { msg: GossipMsg },
+    Raft { rpc: Rpc },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +62,8 @@ struct State {
     name: String,
     seen: HashSet<String>,
     peers: HashMap<String, PeerLink>,
+    by_name: HashMap<String, String>,
+    raft: Raft,
 }
 
 impl State {
@@ -83,15 +90,19 @@ async fn main() -> Result<()> {
     let name = args
         .name
         .unwrap_or_else(|| format!("xanadu-{}", &node_id[..8]));
+    std::fs::create_dir_all(&args.data)?;
+    let raft = Raft::new(name.clone(), args.cluster.clone(), &args.data);
 
     let state = Arc::new(Mutex::new(State {
         node_id: node_id.clone(),
         name: name.clone(),
         seen: HashSet::new(),
         peers: HashMap::new(),
+        by_name: HashMap::new(),
+        raft,
     }));
 
-    info!(%name, %node_id, listen = %args.listen, "xanadu v0.1 starting");
+    info!(%name, %node_id, listen = %args.listen, cluster = ?args.cluster, "xanadu v0.2 starting");
 
     let listener = TcpListener::bind(args.listen).await?;
     {
@@ -117,6 +128,21 @@ async fn main() -> Result<()> {
         spawn_dialer(state.clone(), peer);
     }
 
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(40));
+            loop {
+                tick.tick().await;
+                let actions = {
+                    let mut st = state.lock().await;
+                    st.raft.tick(Instant::now())
+                };
+                dispatch(&state, actions).await;
+            }
+        });
+    }
+
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = stdin.next_line().await {
         let line = line.trim().to_string();
@@ -131,6 +157,11 @@ async fn main() -> Result<()> {
             }
             continue;
         }
+        if line == "/raft" {
+            let st = state.lock().await;
+            info!("{}", st.raft.status());
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("/peer ") {
             match rest.trim().parse::<SocketAddr>() {
                 Ok(addr) => {
@@ -139,6 +170,20 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => warn!("usage: /peer 127.0.0.1:9101 ({e})"),
             }
+            continue;
+        }
+        if let Some(cmd) = line.strip_prefix("/commit ") {
+            let actions = {
+                let mut st = state.lock().await;
+                match st.raft.submit(cmd.to_string()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("commit rejected: {e}");
+                        Vec::new()
+                    }
+                }
+            };
+            dispatch(&state, actions).await;
             continue;
         }
         let gossip = {
@@ -218,7 +263,7 @@ async fn handle_conn(
         None => bail!("peer closed before handshake"),
     }
 
-    let (tx, mut rx) = broadcast::channel::<String>(64);
+    let (tx, mut rx) = broadcast::channel::<String>(256);
     let mut peer_id: Option<String> = None;
 
     if !initiator {
@@ -249,6 +294,7 @@ async fn handle_conn(
                         peer_id = Some(node_id.clone());
                         {
                             let mut st = state.lock().await;
+                            st.by_name.insert(name.clone(), node_id.clone());
                             st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
                         }
                         write_frame(
@@ -263,6 +309,7 @@ async fn handle_conn(
                         info!(%addr, %name, %node_id, "welcome");
                         peer_id = Some(node_id.clone());
                         let mut st = state.lock().await;
+                        st.by_name.insert(name.clone(), node_id.clone());
                         st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
                     }
                     Wire::Gossip { msg } => {
@@ -279,6 +326,13 @@ async fn handle_conn(
                             fwd.ttl -= 1;
                             flood(&state, &fwd, peer_id.as_deref()).await;
                         }
+                    }
+                    Wire::Raft { rpc } => {
+                        let actions = {
+                            let mut st = state.lock().await;
+                            st.raft.on_rpc(rpc, Instant::now())
+                        };
+                        dispatch(&state, actions).await;
                     }
                 }
             }
@@ -297,9 +351,43 @@ async fn handle_conn(
 
     if let Some(id) = peer_id {
         let mut st = state.lock().await;
-        st.peers.remove(&id);
+        if let Some(link) = st.peers.remove(&id) {
+            st.by_name.remove(&link.name);
+        }
     }
     Ok(())
+}
+
+async fn dispatch(state: &Arc<Mutex<State>>, actions: Vec<Action>) {
+    for action in actions {
+        match action {
+            Action::Info(msg) => info!(raft = %msg, "raft"),
+            Action::Apply { index, command } => {
+                info!(index, "raft committed: {command}");
+            }
+            Action::Send { to, rpc } => {
+                let frame = match serde_json::to_string(&Wire::Raft { rpc }) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let st = state.lock().await;
+                match to {
+                    None => {
+                        for link in st.peers.values() {
+                            let _ = link.tx.send(frame.clone());
+                        }
+                    }
+                    Some(name) => {
+                        if let Some(id) = st.by_name.get(&name) {
+                            if let Some(link) = st.peers.get(id) {
+                                let _ = link.tx.send(frame);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn flood(state: &Arc<Mutex<State>>, msg: &GossipMsg, except: Option<&str>) {

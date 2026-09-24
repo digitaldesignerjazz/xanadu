@@ -1,8 +1,8 @@
 [package]
 name = "xanadu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Xanadu v0.1 — decentralized mesh core: messages and gossip broadcast"
+description = "Xanadu mesh core: gossip broadcast + Raft consensus"
 license = "MIT"
 authors = ["Esslinger & Co."]
 

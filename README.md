@@ -1,52 +1,56 @@
 # Xanadu
 
-**Decentralized Mesh Networking Core** — Messages, Broadcasts, and Secure File Transfer
+**Decentralized Mesh Networking Core** — Gossip + Raft consensus
 
-> Status: **v0.1.1**. Gossip mesh with TTL + dedup + `XANADU/0.1` handshake. Local / Docker only. No live keys.
+> Status: **v0.2**. Local / Docker only. No live overlay keys.
 
-## Quick start
+## Three-node mesh + Raft (Onyx)
 
-Use free ports. **Host 9000 is often Docker.** Default listen is `0.0.0.0:9100`.
+Host port 9000 is Docker. Use 9100+.
+
+Stop the old binaries first (`kill` the three `xanadu` PIDs), then:
 
 ```bash
-# Terminal 1 — bootstrap
-cargo run -- --listen 0.0.0.0:9100 --name alpha
+cd ~/xanadu && git pull
+
+# Terminal 1
+cargo run -- --listen 0.0.0.0:9100 --name alpha --cluster alpha,beta,gamma
 
 # Terminal 2
-cargo run -- --listen 0.0.0.0:9101 --name beta --peer 127.0.0.1:9100
+cargo run -- --listen 0.0.0.0:9101 --name beta --cluster alpha,beta,gamma \
+  --peer 127.0.0.1:9100
 
-# Terminal 3 — alpha AND beta as peers
-cargo run -- --listen 0.0.0.0:9102 --name gamma \
+# Terminal 3
+cargo run -- --listen 0.0.0.0:9102 --name gamma --cluster alpha,beta,gamma \
   --peer 127.0.0.1:9100 --peer 127.0.0.1:9101
 ```
 
-`--peer` is repeatable. On a running node (after `git pull`):
+In any terminal:
 
 ```text
-/peer 127.0.0.1:9101
+/raft
 /peers
+/commit hello-from-leader
 ```
 
-Type a line and press Enter to flood. You should see `hello` / `welcome`, not `bad frame`.
+`/commit` is accepted only on the leader. Followers log `commit rejected: not leader`. After quorum (2 of 3) every node prints `raft committed:`.
 
-```bash
-ss -ltnp | grep -E '9100|9000'
-```
+Raft state is stored under `.xanadu/<name>.raft.json`.
 
-## Docker
+## Gossip
 
-```bash
-docker compose up --build
-```
-
-Compose maps 9100, not host 9000.
+A line that is not a `/command` still floods as before.
 
 ## Protocol
 
-First line: `XANADU/0.1`
-Then JSON lines: `hello` / `welcome` / `gossip`.
+First line: `XANADU/0.1`  
+JSON lines: `hello` / `welcome` / `gossip` / `raft`
 
-## Related
+Raft RPCs: RequestVote, RequestVoteResp, AppendEntries, AppendEntriesResp.
+This is a teaching implementation (in-process ticks, file persist, no membership change protocol, no pre-vote, no snapshotting).
 
-- [Nexus](https://github.com/digitaldesignerjazz/nexus)
-- [xnet-mesh](https://github.com/digitaldesignerjazz/xnet-mesh)
+## Tests
+
+```bash
+cargo test
+```
