@@ -1,7 +1,9 @@
+mod kv;
 mod raft;
 
 use anyhow::{bail, Result};
 use clap::Parser;
+use kv::Kv;
 use raft::{Action, Raft, Rpc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -20,7 +22,7 @@ const DEFAULT_TTL: u8 = 8;
 const PROTO: &str = "XANADU/0.1";
 
 #[derive(Parser, Debug)]
-#[command(name = "xanadu", about = "Xanadu mesh — gossip + Raft")]
+#[command(name = "xanadu", about = "Xanadu mesh — gossip + Raft + KV")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:9100")]
     listen: SocketAddr,
@@ -28,7 +30,6 @@ struct Args {
     peer: Vec<SocketAddr>,
     #[arg(long)]
     name: Option<String>,
-    /// Cluster member names for Raft quorum, e.g. alpha,beta,gamma
     #[arg(long, value_delimiter = ',')]
     cluster: Vec<String>,
     #[arg(long, default_value = ".xanadu")]
@@ -64,6 +65,7 @@ struct State {
     peers: HashMap<String, PeerLink>,
     by_name: HashMap<String, String>,
     raft: Raft,
+    kv: Kv,
 }
 
 impl State {
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("xanadu-{}", &node_id[..8]));
     std::fs::create_dir_all(&args.data)?;
     let raft = Raft::new(name.clone(), args.cluster.clone(), &args.data);
+    let kv = Kv::load(&args.data, &name);
 
     let state = Arc::new(Mutex::new(State {
         node_id: node_id.clone(),
@@ -100,9 +103,10 @@ async fn main() -> Result<()> {
         peers: HashMap::new(),
         by_name: HashMap::new(),
         raft,
+        kv,
     }));
 
-    info!(%name, %node_id, listen = %args.listen, cluster = ?args.cluster, "xanadu v0.2 starting");
+    info!(%name, %node_id, listen = %args.listen, cluster = ?args.cluster, "xanadu v0.3 starting");
 
     let listener = TcpListener::bind(args.listen).await?;
     {
@@ -163,6 +167,27 @@ async fn main() -> Result<()> {
             info!("{}", st.raft.status());
             continue;
         }
+        if line == "/kv" {
+            let st = state.lock().await;
+            info!(applied = st.kv.last_applied, "kv dump");
+            for (k, v) in st.kv.dump() {
+                info!(key = %k, value = %v, "kv");
+            }
+            continue;
+        }
+        if line == "/snapshot" {
+            let mut st = state.lock().await;
+            st.kv.snapshot();
+            continue;
+        }
+        if let Some(key) = line.strip_prefix("/get ") {
+            let st = state.lock().await;
+            match st.kv.get(key.trim()) {
+                Some(v) => info!(key = key.trim(), value = v, "kv get"),
+                None => info!(key = key.trim(), "kv miss"),
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("/peer ") {
             match rest.trim().parse::<SocketAddr>() {
                 Ok(addr) => {
@@ -173,18 +198,16 @@ async fn main() -> Result<()> {
             }
             continue;
         }
+        if let Some(rest) = line.strip_prefix("/set ") {
+            submit_cmd(&state, format!("SET {rest}")).await;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/del ") {
+            submit_cmd(&state, format!("DEL {rest}")).await;
+            continue;
+        }
         if let Some(cmd) = line.strip_prefix("/commit ") {
-            let actions = {
-                let mut st = state.lock().await;
-                match st.raft.submit(cmd.to_string()) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!("commit rejected: {e}");
-                        Vec::new()
-                    }
-                }
-            };
-            dispatch(&state, actions).await;
+            submit_cmd(&state, cmd.to_string()).await;
             continue;
         }
         let gossip = {
@@ -202,6 +225,20 @@ async fn main() -> Result<()> {
         flood(&state, &gossip, None).await;
     }
     Ok(())
+}
+
+async fn submit_cmd(state: &Arc<Mutex<State>>, cmd: String) {
+    let actions = {
+        let mut st = state.lock().await;
+        match st.raft.submit(cmd) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("commit rejected: {e}");
+                Vec::new()
+            }
+        }
+    };
+    dispatch(state, actions).await;
 }
 
 fn spawn_dialer(state: Arc<Mutex<State>>, peer: SocketAddr) {
@@ -365,6 +402,8 @@ async fn dispatch(state: &Arc<Mutex<State>>, actions: Vec<Action>) {
             Action::Info(msg) => info!(raft = %msg, "raft"),
             Action::Apply { index, command } => {
                 info!(index, "raft committed: {command}");
+                let mut st = state.lock().await;
+                st.kv.apply(index, &command);
             }
             Action::Send { to, rpc } => {
                 let frame = match serde_json::to_string(&Wire::Raft { rpc }) {
