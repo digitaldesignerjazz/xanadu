@@ -1,14 +1,20 @@
 services:
   alpha:
     build: .
-    command: ["--listen", "0.0.0.0:9000", "--name", "alpha"]
+    command: ["--listen", "0.0.0.0:9100", "--name", "alpha"]
     ports:
-      - "9000:9000"
+      - "9100:9100"
   beta:
     build: .
-    command: ["--listen", "0.0.0.0:9000", "--name", "beta", "--peer", "alpha:9000"]
+    command: ["--listen", "0.0.0.0:9100", "--name", "beta", "--peer", "alpha:9100"]
     depends_on: [alpha]
   gamma:
     build: .
-    command: ["--listen", "0.0.0.0:9000", "--name", "gamma", "--peer", "alpha:9000"]
-    depends_on: [alpha]
+    command:
+      [
+        "--listen", "0.0.0.0:9100",
+        "--name", "gamma",
+        "--peer", "alpha:9100",
+        "--peer", "beta:9100",
+      ]
+    depends_on: [alpha, beta]

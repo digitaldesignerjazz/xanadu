@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:9100")]
     listen: SocketAddr,
 
-    /// Bootstrap peer addresses (repeatable)
+    /// Bootstrap peer addresses (repeatable: --peer a --peer b)
     #[arg(long)]
     peer: Vec<SocketAddr>,
 
@@ -47,11 +47,16 @@ struct GossipMsg {
     body: String,
 }
 
+struct PeerLink {
+    name: String,
+    tx: broadcast::Sender<String>,
+}
+
 struct State {
     node_id: String,
     name: String,
     seen: HashSet<String>,
-    peers: HashMap<String, broadcast::Sender<String>>,
+    peers: HashMap<String, PeerLink>,
 }
 
 impl State {
@@ -109,28 +114,7 @@ async fn main() -> Result<()> {
     }
 
     for peer in args.peer {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut delay = Duration::from_secs(2);
-            loop {
-                match TcpStream::connect(peer).await {
-                    Ok(stream) => {
-                        match handle_conn(state.clone(), stream, peer, true).await {
-                            Ok(()) => delay = Duration::from_secs(2),
-                            Err(e) => {
-                                warn!(%peer, "outbound closed: {e:#}");
-                                delay = (delay * 2).min(Duration::from_secs(30));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(%peer, "connect failed: {e:#}");
-                        delay = (delay * 2).min(Duration::from_secs(30));
-                    }
-                }
-                tokio::time::sleep(delay).await;
-            }
-        });
+        spawn_dialer(state.clone(), peer);
     }
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -141,7 +125,20 @@ async fn main() -> Result<()> {
         }
         if line == "/peers" {
             let st = state.lock().await;
-            info!(peers = st.peers.len(), "connected peers");
+            info!(count = st.peers.len(), "connected peers");
+            for (id, link) in &st.peers {
+                info!(%id, name = %link.name, "peer");
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/peer ") {
+            match rest.trim().parse::<SocketAddr>() {
+                Ok(addr) => {
+                    info!(%addr, "adding outbound peer");
+                    spawn_dialer(state.clone(), addr);
+                }
+                Err(e) => warn!("usage: /peer 127.0.0.1:9101 ({e})"),
+            }
             continue;
         }
         let gossip = {
@@ -159,6 +156,28 @@ async fn main() -> Result<()> {
         flood(&state, &gossip, None).await;
     }
     Ok(())
+}
+
+fn spawn_dialer(state: Arc<Mutex<State>>, peer: SocketAddr) {
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(peer).await {
+                Ok(stream) => match handle_conn(state.clone(), stream, peer, true).await {
+                    Ok(()) => delay = Duration::from_secs(2),
+                    Err(e) => {
+                        warn!(%peer, "outbound closed: {e:#}");
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                },
+                Err(e) => {
+                    warn!(%peer, "connect failed: {e:#}");
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            }
+            tokio::time::sleep(delay).await;
+        }
+    });
 }
 
 async fn handle_conn(
@@ -230,7 +249,7 @@ async fn handle_conn(
                         peer_id = Some(node_id.clone());
                         {
                             let mut st = state.lock().await;
-                            st.peers.insert(node_id, tx.clone());
+                            st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
                         }
                         write_frame(
                             &mut writer,
@@ -244,7 +263,7 @@ async fn handle_conn(
                         info!(%addr, %name, %node_id, "welcome");
                         peer_id = Some(node_id.clone());
                         let mut st = state.lock().await;
-                        st.peers.insert(node_id, tx.clone());
+                        st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
                     }
                     Wire::Gossip { msg } => {
                         let fresh = {
@@ -289,11 +308,11 @@ async fn flood(state: &Arc<Mutex<State>>, msg: &GossipMsg, except: Option<&str>)
         Err(_) => return,
     };
     let st = state.lock().await;
-    for (id, tx) in &st.peers {
+    for (id, link) in &st.peers {
         if except.is_some_and(|ex| ex == id) {
             continue;
         }
-        let _ = tx.send(frame.clone());
+        let _ = link.tx.send(frame.clone());
     }
 }
 

@@ -6,21 +6,28 @@
 
 ## Quick start
 
-Use free ports. **9000 is often already taken** (HTTP, PHP-FPM, other prototypes). Default listen is now `0.0.0.0:9100`.
+Use free ports. **Host 9000 is often Docker.** Default listen is `0.0.0.0:9100`.
 
 ```bash
-git pull
-
 # Terminal 1 — bootstrap
 cargo run -- --listen 0.0.0.0:9100 --name alpha
 
 # Terminal 2
 cargo run -- --listen 0.0.0.0:9101 --name beta --peer 127.0.0.1:9100
+
+# Terminal 3 — alpha AND beta as peers
+cargo run -- --listen 0.0.0.0:9102 --name gamma \
+  --peer 127.0.0.1:9100 --peer 127.0.0.1:9101
 ```
 
-You should see `hello` / `welcome`, not `bad frame`. Type a line, press Enter. `/peers` prints the live count.
+`--peer` is repeatable. On a running node (after `git pull`):
 
-If a peer answers with anything other than `XANADU/0.1`, the node closes and logs the first line so you can see what actually owns that port:
+```text
+/peer 127.0.0.1:9101
+/peers
+```
+
+Type a line and press Enter to flood. You should see `hello` / `welcome`, not `bad frame`.
 
 ```bash
 ss -ltnp | grep -E '9100|9000'
@@ -31,6 +38,8 @@ ss -ltnp | grep -E '9100|9000'
 ```bash
 docker compose up --build
 ```
+
+Compose maps 9100, not host 9000.
 
 ## Protocol
 
