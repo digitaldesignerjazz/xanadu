@@ -2,74 +2,66 @@
 
 **Decentralized Mesh Networking Core** — Messages, Broadcasts, and Secure File Transfer
 
-> "In Xanadu did Kubla Khan a stately pleasure-dome decree..."  
-> A visionary foundation where resilient, privacy-first decentralized networking meets creative and technical innovation.
+> Status: **v0.1 live in-repo**. Gossip mesh with TTL + dedup. No live keys. Local / Docker only.
 
-Xanadu serves as the dedicated core implementation for decentralized mesh networking within the broader Esslinger & Co. ecosystem. It focuses on robust peer-to-peer messaging, efficient broadcast mechanisms, and secure file transfer capabilities designed for dynamic, partition-tolerant networks (building on and extending concepts from Yggdrasil, custom xMesh/NovaNet/QNET protocols, Tenda Nova, and Docker-orchestrated deployments).
+Xanadu is the mesh core for the Esslinger & Co. / Nexus lineage. v0.1 ships a working TCP gossip node: handshake, flood broadcast with message-id deduplication and TTL, stdin publish, Docker three-node harness.
 
-## Vision & Goals
+This is not a live overlay on the Hannover host. Overlay binaries (Tailscale / NetBird / Yggdrasil / Docker on that host) remain a separate activation step.
 
-- **Resilient Connectivity**: Enable reliable communication in mesh environments that may experience partitions, high latency, or intermittent connectivity — core to global decentralized infrastructure.
-- **Privacy by Design**: Deep integration potential with Tor, I2P, and end-to-end encryption for all messaging, broadcasts, and file transfers.
-- **Efficient Broadcasting**: Scalable pub/sub and gossip-style broadcast protocols optimized for mesh topologies.
-- **Secure File Transfer**: Chunked, verifiable, resumable transfers with integrity checks and optional encryption.
-- **Extensibility & Integration**: Clean APIs and modular design for integration with:
-  - Nexus (central orchestration hub)
-  - QNET / XCoin blockchain layer (consensus, incentives, or on-mesh coordination)
-  - AI agent swarms (intelligent routing, predictive healing, swarm-coordinated file distribution)
-  - Prototypes (Grok Launcher monitoring, Soilnova/Vista Nova hardware mesh nodes)
-- **Creative & Immersive Layer**: Support for narrative, roleplay, and artistic extensions — e.g., immersive mesh-based storytelling environments, agent-driven world-building, or Suno-integrated audio experiences over the mesh.
-
-## Current Status
-
-This repository is in active initialization. Core protocol skeletons, messaging primitives, and Docker networking foundations are being established.
-
-## Tech Stack & Architecture Highlights
-
-- **Core Language(s)**: Rust (performance-critical mesh core, potential Grok Launcher extensions) and/or Python (tooling, simulations, agent interfaces)
-- **Networking**: Yggdrasil integration or custom overlay, Docker networking for simulation/testing, Tenda Nova hardware support
-- **Messaging & Broadcasts**: Custom gossip/pub-sub protocols, topic-based routing, presence and discovery
-- **File Transfer**: Resumable, Merkle-tree or chunked verifiable transfers with optional encryption
-- **Privacy & Security**: Tor/I2P pluggable transports, Noise protocol or similar for link encryption, capability-based access
-- **Observability**: Metrics, logging, and integration points for monitoring dashboards
-- **Deployment**: Docker-first for reproducible mesh simulations; native Linux support; potential embedded targets for hardware prototypes
-
-## Getting Started (Planned)
+## Quick start (local)
 
 ```bash
-# Clone
- git clone https://github.com/digitaldesignerjazz/xanadu.git
- cd xanadu
+git clone https://github.com/digitaldesignerjazz/xanadu.git
+cd xanadu
 
-# Example: Build core (once implemented)
-# cargo build --release
+# Node A
+cargo run -- --listen 0.0.0.0:9000 --name alpha
 
-# Run mesh simulation with Docker
-# docker-compose up
+# Node B (second terminal)
+cargo run -- --listen 0.0.0.0:9001 --name beta --peer 127.0.0.1:9000
+
+# Node C
+cargo run -- --listen 0.0.0.0:9002 --name gamma --peer 127.0.0.1:9000
 ```
 
-See `CONTRIBUTING.md` and upcoming `ARCHITECTURE.md` / `PROTOCOL.md` for detailed development guidelines.
+Type a line and press Enter. It floods to all connected peers. `/peers` prints the live peer count.
 
-## Roadmap Teaser
+## Quick start (Docker harness)
 
-- v0.1: Foundational messaging + simple broadcast primitives + Docker test harness
-- v0.2: Secure file transfer module with integrity & encryption
-- v0.3: Yggdrasil / custom overlay integration & peer discovery
-- v0.4: AI agent hooks for intelligent routing & network healing
-- v0.5: Blockchain (QNET) coordination hooks + incentive primitives
-- Future: Hardware node support, immersive/creative mesh applications, global testnet
+```bash
+docker compose up --build
+```
 
-## Related Projects
+Three nodes: `alpha` (bootstrap), `beta` and `gamma` peer to alpha. Attach to a container and type:
 
-- [Nexus](https://github.com/digitaldesignerjazz/nexus) — Central integration hub
-- Broader ecosystem: xMesh/NovaNet/QNET, Grok Launcher, QCoin/XCoin, AI swarms, Esslinger & Co. prototypes
+```bash
+docker compose exec alpha sh -c 'echo hello-from-alpha'
+```
 
-## Contributing
+Stdin attach works if you run a node without compose detach, or use `cargo run` locally.
 
-We welcome contributions focused on mesh resilience, privacy tech, protocol design, Rust/Python implementations, Docker networking, and creative extensions. See `CONTRIBUTING.md` for details.
+## Protocol (v0.1)
 
-**X / Contact**: [@SirLancelotEsq](https://x.com/SirLancelotEsq)
+JSON lines over TCP:
 
----
+- `hello` / `welcome` — node_id + name
+- `gossip` — `{id, origin, ttl, body}`
 
-*Part of the Esslinger & Co. vision for decentralized, self-improving, and creatively empowered global connectivity.*
+Fresh ids are remembered (cap 4096). TTL decrements on forward. No encryption yet (roadmap v0.2+). Do not put secrets on this plane.
+
+## Roadmap
+
+- [x] v0.1 Foundational messaging + gossip + Docker harness
+- [ ] v0.2 Secure file transfer + Noise/TLS
+- [ ] v0.3 Yggdrasil / custom overlay + discovery
+- [ ] v0.4 AI agent hooks
+- [ ] v0.5 QNET coordination hooks
+
+## Related
+
+- [Nexus](https://github.com/digitaldesignerjazz/nexus)
+- [xnet-mesh](https://github.com/digitaldesignerjazz/xnet-mesh)
+
+**X**: [@SirLancelotEsq](https://x.com/SirLancelotEsq)
+
+MIT License.

@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.env
+*.pem
+*.key
+config/local*
