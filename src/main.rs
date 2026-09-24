@@ -131,12 +131,13 @@ async fn main() -> Result<()> {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(40));
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
             loop {
                 tick.tick().await;
                 let actions = {
                     let mut st = state.lock().await;
-                    st.raft.tick(Instant::now())
+                    let live: Vec<String> = st.by_name.keys().cloned().collect();
+                    st.raft.tick(Instant::now(), &live)
                 };
                 dispatch(&state, actions).await;
             }
