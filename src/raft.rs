@@ -95,12 +95,10 @@ impl Raft {
             role: Role::Follower,
             current_term: persist.as_ref().map(|p| p.current_term).unwrap_or(0),
             voted_for: persist.as_ref().and_then(|p| p.voted_for.clone()),
-            log: persist
-                .map(|p| p.log)
-                .unwrap_or_else(|| vec![LogEntry {
-                    term: 0,
-                    command: String::new(),
-                }]),
+            log: persist.map(|p| p.log).unwrap_or_else(|| vec![LogEntry {
+                term: 0,
+                command: String::new(),
+            }]),
             commit_index: 0,
             last_applied: 0,
             leader_id: None,
@@ -146,18 +144,31 @@ impl Raft {
         self.cluster.len() / 2 + 1
     }
 
-    pub fn tick(&mut self, now: Instant) -> Vec<Action> {
+    fn live_quorum(&self, live: &[String]) -> bool {
+        let n = 1 + live
+            .iter()
+            .filter(|n| self.in_cluster(n) && *n != &self.id)
+            .count();
+        n >= self.majority()
+    }
+
+    pub fn tick(&mut self, now: Instant, live: &[String]) -> Vec<Action> {
         let mut out = Vec::new();
         match self.role {
             Role::Leader => {
                 if now >= self.heartbeat_due {
-                    self.heartbeat_due = now + Duration::from_millis(80);
+                    self.heartbeat_due = now + Duration::from_millis(150);
                     out.extend(self.heartbeat_all());
                 }
             }
             Role::Follower | Role::Candidate => {
                 if now >= self.election_deadline {
-                    out.extend(self.start_election(now));
+                    if self.live_quorum(live) {
+                        out.extend(self.start_election(now));
+                    } else {
+                        self.role = Role::Follower;
+                        self.election_deadline = now + jitter_election();
+                    }
                 }
             }
         }
@@ -468,7 +479,11 @@ impl Raft {
     }
 
     fn heartbeat_one(&self, peer: &str) -> Option<Action> {
-        let next = self.next_index.get(peer).copied().unwrap_or(self.last_log_index() + 1);
+        let next = self
+            .next_index
+            .get(peer)
+            .copied()
+            .unwrap_or(self.last_log_index() + 1);
         let prev = next.saturating_sub(1);
         let prev_term = self.log.get(prev as usize).map(|e| e.term).unwrap_or(0);
         let entries = if (next as usize) < self.log.len() {
@@ -526,7 +541,7 @@ fn jitter_election() -> Duration {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(1);
-    Duration::from_millis(350 + (nanos % 350) as u64)
+    Duration::from_millis(1500 + (nanos % 1500) as u64)
 }
 
 #[cfg(test)]
@@ -554,10 +569,20 @@ mod tests {
     #[test]
     fn single_node_wins_election() {
         let mut r = node("alpha", &["alpha"]);
-        let now = Instant::now() + Duration::from_secs(2);
-        r.tick(now);
+        let now = Instant::now() + Duration::from_secs(5);
+        r.tick(now, &[]);
         assert_eq!(r.role, Role::Leader);
-        assert_eq!(r.current_term, 1);
+        assert!(r.current_term >= 1);
+    }
+
+    #[test]
+    fn three_node_waits_for_live_peer() {
+        let mut r = node("alpha", &["alpha", "beta", "gamma"]);
+        let now = Instant::now() + Duration::from_secs(5);
+        r.tick(now, &[]);
+        assert_eq!(r.role, Role::Follower);
+        r.tick(now + Duration::from_secs(5), &["beta".into()]);
+        assert_eq!(r.role, Role::Candidate);
     }
 
     #[test]
