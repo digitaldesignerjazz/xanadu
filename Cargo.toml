@@ -1,8 +1,8 @@
 [package]
 name = "xanadu"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Xanadu mesh core: gossip, Raft, persistent KV"
+description = "Xanadu mesh core: gossip, Raft, persistent KV, InstallSnapshot"
 license = "MIT"
 authors = ["Esslinger & Co."]
 
@@ -11,6 +11,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
