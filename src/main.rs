@@ -1,11 +1,13 @@
 mod kv;
 mod raft;
+mod snapshot;
 
 use anyhow::{bail, Result};
 use clap::Parser;
 use kv::Kv;
-use raft::{Action, Raft, Rpc};
+use raft::{Action, Raft, Rpc, Role};
 use serde::{Deserialize, Serialize};
+use snapshot::{chunks, sha256_hex, Assembler, SnapBlob};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,7 +24,7 @@ const DEFAULT_TTL: u8 = 8;
 const PROTO: &str = "XANADU/0.1";
 
 #[derive(Parser, Debug)]
-#[command(name = "xanadu", about = "Xanadu mesh — gossip + Raft + KV")]
+#[command(name = "xanadu", about = "Xanadu mesh — gossip + Raft + KV + snapshot")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:9100")]
     listen: SocketAddr,
@@ -43,6 +45,22 @@ enum Wire {
     Welcome { node_id: String, name: String },
     Gossip { msg: GossipMsg },
     Raft { rpc: Rpc },
+    Snapshot {
+        term: u64,
+        leader_id: String,
+        last_included_index: u64,
+        last_included_term: u64,
+        offset: u64,
+        data_hex: String,
+        done: bool,
+        sha256: String,
+    },
+    SnapshotAck {
+        term: u64,
+        follower: String,
+        success: bool,
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +84,7 @@ struct State {
     by_name: HashMap<String, String>,
     raft: Raft,
     kv: Kv,
+    assembler: Assembler,
 }
 
 impl State {
@@ -104,9 +123,10 @@ async fn main() -> Result<()> {
         by_name: HashMap::new(),
         raft,
         kv,
+        assembler: Assembler::default(),
     }));
 
-    info!(%name, %node_id, listen = %args.listen, cluster = ?args.cluster, "xanadu v0.3 starting");
+    info!(%name, %node_id, listen = %args.listen, cluster = ?args.cluster, "xanadu v0.4 starting");
 
     let listener = TcpListener::bind(args.listen).await?;
     {
@@ -176,8 +196,11 @@ async fn main() -> Result<()> {
             continue;
         }
         if line == "/snapshot" {
-            let mut st = state.lock().await;
-            st.kv.snapshot();
+            {
+                let mut st = state.lock().await;
+                st.kv.snapshot();
+            }
+            push_snapshot(&state, None).await;
             continue;
         }
         if let Some(key) = line.strip_prefix("/get ") {
@@ -241,6 +264,84 @@ async fn submit_cmd(state: &Arc<Mutex<State>>, cmd: String) {
     dispatch(state, actions).await;
 }
 
+fn to_hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd hex".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn send_line(st: &State, to: Option<&str>, line: &str) {
+    match to {
+        None => {
+            for link in st.peers.values() {
+                let _ = link.tx.send(line.to_string());
+            }
+        }
+        Some(name) => {
+            if let Some(id) = st.by_name.get(name) {
+                if let Some(link) = st.peers.get(id) {
+                    let _ = link.tx.send(line.to_string());
+                }
+            }
+        }
+    }
+}
+
+async fn push_snapshot(state: &Arc<Mutex<State>>, to: Option<String>) {
+    let frames = {
+        let st = state.lock().await;
+        if st.raft.role != Role::Leader {
+            warn!("snapshot push skipped: not leader");
+            return;
+        }
+        let blob = SnapBlob {
+            last_included_index: st.kv.last_applied.max(st.raft.commit_index),
+            last_included_term: st.raft.current_term,
+            map: st.kv.map_clone(),
+        };
+        let raw = match blob.encode() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let hash = sha256_hex(&raw);
+        let parts = chunks(&raw);
+        info!(
+            bytes = raw.len(),
+            chunks = parts.len(),
+            sha256 = %hash,
+            "pushing snapshot"
+        );
+        let mut frames = Vec::new();
+        for (offset, part, done) in parts {
+            frames.push(Wire::Snapshot {
+                term: st.raft.current_term,
+                leader_id: st.raft.id.clone(),
+                last_included_index: blob.last_included_index,
+                last_included_term: blob.last_included_term,
+                offset,
+                data_hex: to_hex(&part),
+                done,
+                sha256: hash.clone(),
+            });
+        }
+        frames
+    };
+    let st = state.lock().await;
+    for frame in frames {
+        if let Ok(line) = serde_json::to_string(&frame) {
+            send_line(&st, to.as_deref(), &line);
+        }
+    }
+}
+
 fn spawn_dialer(state: Arc<Mutex<State>>, peer: SocketAddr) {
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(2);
@@ -261,6 +362,16 @@ fn spawn_dialer(state: Arc<Mutex<State>>, peer: SocketAddr) {
             tokio::time::sleep(delay).await;
         }
     });
+}
+
+async fn maybe_catchup(state: &Arc<Mutex<State>>, peer_name: &str) {
+    let should = {
+        let st = state.lock().await;
+        st.raft.role == Role::Leader && st.kv.last_applied > 0
+    };
+    if should {
+        push_snapshot(state, Some(peer_name.to_string())).await;
+    }
 }
 
 async fn handle_conn(
@@ -303,6 +414,7 @@ async fn handle_conn(
 
     let (tx, mut rx) = broadcast::channel::<String>(256);
     let mut peer_id: Option<String> = None;
+    let mut peer_name: Option<String> = None;
 
     if !initiator {
         write_frame(
@@ -330,10 +442,11 @@ async fn handle_conn(
                     Wire::Hello { node_id, name } => {
                         info!(%addr, %name, %node_id, "hello");
                         peer_id = Some(node_id.clone());
+                        peer_name = Some(name.clone());
                         {
                             let mut st = state.lock().await;
                             st.by_name.insert(name.clone(), node_id.clone());
-                            st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
+                            st.peers.insert(node_id, PeerLink { name: name.clone(), tx: tx.clone() });
                         }
                         write_frame(
                             &mut writer,
@@ -342,13 +455,18 @@ async fn handle_conn(
                                 name: local_name.clone(),
                             },
                         ).await?;
+                        maybe_catchup(&state, &name).await;
                     }
                     Wire::Welcome { node_id, name } => {
                         info!(%addr, %name, %node_id, "welcome");
                         peer_id = Some(node_id.clone());
-                        let mut st = state.lock().await;
-                        st.by_name.insert(name.clone(), node_id.clone());
-                        st.peers.insert(node_id, PeerLink { name, tx: tx.clone() });
+                        peer_name = Some(name.clone());
+                        {
+                            let mut st = state.lock().await;
+                            st.by_name.insert(name.clone(), node_id.clone());
+                            st.peers.insert(node_id, PeerLink { name: name.clone(), tx: tx.clone() });
+                        }
+                        maybe_catchup(&state, &name).await;
                     }
                     Wire::Gossip { msg } => {
                         let fresh = {
@@ -372,6 +490,83 @@ async fn handle_conn(
                         };
                         dispatch(&state, actions).await;
                     }
+                    Wire::Snapshot {
+                        term,
+                        leader_id,
+                        last_included_index,
+                        last_included_term,
+                        offset,
+                        data_hex,
+                        done,
+                        sha256,
+                    } => {
+                        let data = match from_hex(&data_hex) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!("snapshot hex: {e}");
+                                continue;
+                            }
+                        };
+                        let ack = {
+                            let mut st = state.lock().await;
+                            if term < st.raft.current_term {
+                                Wire::SnapshotAck {
+                                    term: st.raft.current_term,
+                                    follower: st.name.clone(),
+                                    success: false,
+                                    offset,
+                                }
+                            } else {
+                                match st.assembler.push(
+                                    offset,
+                                    &data,
+                                    done,
+                                    &sha256,
+                                    last_included_index,
+                                    last_included_term,
+                                ) {
+                                    Ok(Some(blob)) => {
+                                        st.kv.install(blob.last_included_index, blob.map);
+                                        info!(
+                                            from = %leader_id,
+                                            index = last_included_index,
+                                            "snapshot installed"
+                                        );
+                                        Wire::SnapshotAck {
+                                            term: st.raft.current_term,
+                                            follower: st.name.clone(),
+                                            success: true,
+                                            offset,
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        info!(offset, "snapshot chunk");
+                                        Wire::SnapshotAck {
+                                            term: st.raft.current_term,
+                                            follower: st.name.clone(),
+                                            success: true,
+                                            offset,
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("snapshot assemble: {e}");
+                                        Wire::SnapshotAck {
+                                            term: st.raft.current_term,
+                                            follower: st.name.clone(),
+                                            success: false,
+                                            offset,
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        if let Ok(line) = serde_json::to_string(&ack) {
+                            let _ = tx.send(line);
+                        }
+                    }
+                    Wire::SnapshotAck { follower, success, offset, .. } => {
+                        info!(%follower, success, offset, "snapshot ack");
+                    }
                 }
             }
             out = rx.recv() => {
@@ -393,6 +588,7 @@ async fn handle_conn(
             st.by_name.remove(&link.name);
         }
     }
+    let _ = peer_name;
     Ok(())
 }
 
@@ -411,20 +607,7 @@ async fn dispatch(state: &Arc<Mutex<State>>, actions: Vec<Action>) {
                     Err(_) => continue,
                 };
                 let st = state.lock().await;
-                match to {
-                    None => {
-                        for link in st.peers.values() {
-                            let _ = link.tx.send(frame.clone());
-                        }
-                    }
-                    Some(name) => {
-                        if let Some(id) = st.by_name.get(&name) {
-                            if let Some(link) = st.peers.get(id) {
-                                let _ = link.tx.send(frame);
-                            }
-                        }
-                    }
-                }
+                send_line(&st, to.as_deref(), &frame);
             }
         }
     }
