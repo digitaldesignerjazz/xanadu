@@ -25,6 +25,6 @@ cargo run -- --listen 0.0.0.0:9102 --name gamma --cluster alpha,beta,gamma --pee
 /snapshot
 ```
 
-`/snapshot` on the leader writes `.xanadu/<name>.kv.json`, compacts the Raft log prefix, and pushes chunked InstallSnapshot as both `Wire::Raft { rpc: InstallSnapshot }` and legacy `Wire::Snapshot` frames (256 B, sha256). A joining peer also gets catch-up if the leader already has applied state. A follower whose `nextIndex` sits behind `lastIncludedIndex` is offered a snapshot instead of log replay.
+`/snapshot` on the leader writes `.xanadu/<name>.kv.json`, calls `Raft::compact` so `last_included_index` moves forward, and pushes chunked InstallSnapshot as both `Wire::Raft { rpc: InstallSnapshot }` and legacy `Wire::Snapshot` frames (256 B, sha256). Followers install the KV map **and** compact their log. A joining peer gets catch-up if the leader already has applied state. A follower whose `nextIndex` sits behind `lastIncludedIndex` triggers a real snapshot push (`need-snapshot`), not only a log line. `/raft` then shows `snap=` as the compacted prefix.
 
 Operator must restart all three nodes after `git pull`.
