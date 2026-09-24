@@ -61,6 +61,17 @@ impl Kv {
         self.persist();
     }
 
+    pub fn install(&mut self, index: u64, map: HashMap<String, String>) {
+        self.map = map;
+        self.last_applied = index;
+        self.persist();
+        info!(index, keys = self.map.len(), "kv installed from snapshot");
+    }
+
+    pub fn map_clone(&self) -> HashMap<String, String> {
+        self.map.clone()
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.map.get(key).map(String::as_str)
     }
