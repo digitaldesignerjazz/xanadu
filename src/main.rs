@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
@@ -12,12 +13,13 @@ use uuid::Uuid;
 
 const MAX_SEEN: usize = 4096;
 const DEFAULT_TTL: u8 = 8;
+const PROTO: &str = "XANADU/0.1";
 
 #[derive(Parser, Debug)]
 #[command(name = "xanadu", about = "Xanadu v0.1 mesh node — gossip broadcast")]
 struct Args {
-    /// Listen address, e.g. 0.0.0.0:9000
-    #[arg(long, default_value = "0.0.0.0:9000")]
+    /// Listen address, e.g. 0.0.0.0:9100
+    #[arg(long, default_value = "0.0.0.0:9100")]
     listen: SocketAddr,
 
     /// Bootstrap peer addresses (repeatable)
@@ -68,9 +70,7 @@ impl State {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
@@ -111,16 +111,24 @@ async fn main() -> Result<()> {
     for peer in args.peer {
         let state = state.clone();
         tokio::spawn(async move {
+            let mut delay = Duration::from_secs(2);
             loop {
                 match TcpStream::connect(peer).await {
                     Ok(stream) => {
-                        if let Err(e) = handle_conn(state.clone(), stream, peer, true).await {
-                            warn!(%peer, "outbound closed: {e:#}");
+                        match handle_conn(state.clone(), stream, peer, true).await {
+                            Ok(()) => delay = Duration::from_secs(2),
+                            Err(e) => {
+                                warn!(%peer, "outbound closed: {e:#}");
+                                delay = (delay * 2).min(Duration::from_secs(30));
+                            }
                         }
                     }
-                    Err(e) => warn!(%peer, "connect failed: {e:#}"),
+                    Err(e) => {
+                        warn!(%peer, "connect failed: {e:#}");
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -168,6 +176,8 @@ async fn handle_conn(
         (st.node_id.clone(), st.name.clone())
     };
 
+    writer.write_all(PROTO.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
     if initiator {
         write_frame(
             &mut writer,
@@ -179,16 +189,40 @@ async fn handle_conn(
         .await?;
     }
 
+    let banner = lines.next_line().await?;
+    match banner.as_deref() {
+        Some(PROTO) => {}
+        Some(other) => {
+            let preview: String = other.chars().take(80).collect();
+            bail!("peer is not Xanadu (first line: {preview:?}) — is another service bound on {addr}?");
+        }
+        None => bail!("peer closed before handshake"),
+    }
+
     let (tx, mut rx) = broadcast::channel::<String>(64);
     let mut peer_id: Option<String> = None;
+
+    if !initiator {
+        write_frame(
+            &mut writer,
+            &Wire::Hello {
+                node_id: local_id.clone(),
+                name: local_name.clone(),
+            },
+        )
+        .await?;
+    }
 
     loop {
         tokio::select! {
             line = lines.next_line() => {
                 let Some(line) = line? else { break; };
-                let Ok(frame) = serde_json::from_str::<Wire>(&line) else {
-                    warn!(%addr, "bad frame");
-                    continue;
+                let frame = match serde_json::from_str::<Wire>(&line) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        let preview: String = line.chars().take(80).collect();
+                        bail!("bad frame from {addr}: {preview:?}");
+                    }
                 };
                 match frame {
                     Wire::Hello { node_id, name } => {
