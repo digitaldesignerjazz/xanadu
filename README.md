@@ -1,8 +1,8 @@
 # Xanadu
 
-**Gossip + Raft + persistent KV + InstallSnapshot**
+**Gossip + Raft + persistent KV + InstallSnapshot + log prefix compaction**
 
-> Status: **v0.4**. Local / Docker only. No live overlay keys.
+> Status: **v0.5**. Local / Docker only. No live overlay keys.
 
 ## Cluster
 
@@ -25,6 +25,6 @@ cargo run -- --listen 0.0.0.0:9102 --name gamma --cluster alpha,beta,gamma --pee
 /snapshot
 ```
 
-`/snapshot` on the leader writes `.xanadu/<name>.kv.json` and pushes chunked InstallSnapshot frames (256 B, sha256) to followers. A joining peer also gets catch-up if the leader already has applied state.
+`/snapshot` on the leader writes `.xanadu/<name>.kv.json`, compacts the Raft log prefix, and pushes chunked InstallSnapshot as both `Wire::Raft { rpc: InstallSnapshot }` and legacy `Wire::Snapshot` frames (256 B, sha256). A joining peer also gets catch-up if the leader already has applied state. A follower whose `nextIndex` sits behind `lastIncludedIndex` is offered a snapshot instead of log replay.
 
-No log prefix compaction yet. No overlay.
+Operator must restart all three nodes after `git pull`.
